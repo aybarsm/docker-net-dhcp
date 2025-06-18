@@ -189,6 +189,12 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		if err != nil {
 			return fmt.Errorf("failed to find container side of veth pair: %w", err)
 		}
+
+		// Inherit the bridge's MTU to the container's interface
+        if err := netlink.LinkSetMTU(ctrLink, bridge.Attrs().MTU); err != nil {
+            return fmt.Errorf("failed to set container interface MTU: %w", err)
+        }
+
 		if err := netlink.LinkSetUp(ctrLink); err != nil {
 			return fmt.Errorf("failed to set container side link of veth pair up: %w", err)
 		}
