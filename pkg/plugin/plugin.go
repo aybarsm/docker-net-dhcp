@@ -58,9 +58,11 @@ func decodeOpts(input interface{}) (DHCPNetworkOptions, error) {
 }
 
 type joinHint struct {
-	IPv4    *netlink.Addr
-	IPv6    *netlink.Addr
-	Gateway string
+	IPv4         *netlink.Addr
+	IPv6         *netlink.Addr
+	Gateway      string
+	IsStaticIPv4 bool
+	IsStaticIPv6 bool
 }
 
 // Plugin is the DHCP network plugin

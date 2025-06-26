@@ -28,6 +28,10 @@ type dhcpManager struct {
 	LastIP   *netlink.Addr
 	LastIPv6 *netlink.Addr
 
+	// Static IP configuration
+	IsStaticIPv4 bool
+	IsStaticIPv6 bool
+
 	nsPath    string
 	hostname  string
 	nsHandle  netns.NsHandle
@@ -124,17 +128,47 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 		v6Str = "v6"
 	}
 
-	log.
-		WithFields(m.logFields(v6)).
-		Info("Starting persistent DHCP client")
+	// Check if this is a static IP endpoint
+	isStatic := (v6 && m.IsStaticIPv6) || (!v6 && m.IsStaticIPv4)
+	
+	if isStatic {
+		log.
+			WithFields(m.logFields(v6)).
+			Info("Starting persistent DHCP INFORM client for static IP endpoint")
+		
+		// For static IPs, we use DHCP INFORM to get network configuration
+		client, err := udhcpc.NewDHCPClientInform(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{
+			Hostname:  m.hostname,
+			V6:        v6,
+			Namespace: m.nsPath,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DHCP%v INFORM client: %w", v6Str, err)
+		}
+		
+		return m.setupStaticClient(client, v6)
+	} else {
+		log.
+			WithFields(m.logFields(v6)).
+			Info("Starting persistent DHCP client")
 
-	client, err := udhcpc.NewDHCPClient(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{
-		Hostname:  m.hostname,
-		V6:        v6,
-		Namespace: m.nsPath,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCP%v client: %w", v6Str, err)
+		client, err := udhcpc.NewDHCPClient(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{
+			Hostname:  m.hostname,
+			V6:        v6,
+			Namespace: m.nsPath,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DHCP%v client: %w", v6Str, err)
+		}
+		
+		return m.setupDynamicClient(client, v6)
+	}
+}
+
+func (m *dhcpManager) setupDynamicClient(client *udhcpc.DHCPClient, v6 bool) (chan error, error) {
+	v6Str := ""
+	if v6 {
+		v6Str = "v6"
 	}
 
 	events, err := client.Start()
@@ -192,6 +226,100 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 				log.
 					WithFields(m.logFields(v6)).
 					Info("Shutting down persistent DHCP client")
+
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				errChan <- client.Finish(ctx)
+				return
+			}
+		}
+	}()
+
+	return errChan, nil
+}
+
+func (m *dhcpManager) setupStaticClient(client *udhcpc.DHCPClient, v6 bool) (chan error, error) {
+	v6Str := ""
+	if v6 {
+		v6Str = "v6"
+	}
+
+	events, err := client.Start()
+	if err != nil {
+		return nil, fmt.Errorf("failed to start DHCP%v INFORM client: %w", v6Str, err)
+	}
+
+	errChan := make(chan error)
+	go func() {
+		for {
+			select {
+			case event := <-events:
+				switch event.Type {
+				case "bound", "renew":
+					// For static IPs, we only care about network configuration updates
+					// like gateway changes, DNS updates, etc.
+					log.
+						WithFields(m.logFields(v6)).
+						Debug("udhcpc INFORM configuration update")
+
+					// Only handle gateway updates for IPv4 (DHCPv6 doesn't provide gateway)
+					if !v6 && event.Data.Gateway != "" {
+						newGateway := net.ParseIP(event.Data.Gateway)
+
+						routes, err := m.netHandle.RouteListFiltered(unix.AF_INET, &netlink.Route{
+							LinkIndex: m.ctrLink.Attrs().Index,
+							Dst:       nil,
+						}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_DST)
+						if err != nil {
+							log.
+								WithError(err).
+								WithFields(m.logFields(v6)).
+								Error("Failed to list routes for static IP gateway update")
+							continue
+						}
+
+						if len(routes) == 0 {
+							log.
+								WithFields(m.logFields(v6)).
+								WithField("gateway", newGateway).
+								Info("udhcpc INFORM adding default route for static IP")
+
+							if err := m.netHandle.RouteAdd(&netlink.Route{
+								LinkIndex: m.ctrLink.Attrs().Index,
+								Gw:        newGateway,
+							}); err != nil {
+								log.
+									WithError(err).
+									WithFields(m.logFields(v6)).
+									Error("Failed to add default route for static IP")
+							}
+						} else if !newGateway.Equal(routes[0].Gw) {
+							log.
+								WithFields(m.logFields(v6)).
+								WithField("old_gateway", routes[0].Gw).
+								WithField("new_gateway", newGateway).
+								Info("udhcpc INFORM updating default route for static IP")
+
+							routes[0].Gw = newGateway
+							if err := m.netHandle.RouteReplace(&routes[0]); err != nil {
+								log.
+									WithError(err).
+									WithFields(m.logFields(v6)).
+									Error("Failed to replace default route for static IP")
+							}
+						}
+					}
+				case "leasefail":
+					log.WithFields(m.logFields(v6)).Warn("udhcpc INFORM failed to get configuration")
+				case "nak":
+					log.WithFields(m.logFields(v6)).Warn("udhcpc INFORM client received NAK")
+				}
+
+			case <-m.stopChan:
+				log.
+					WithFields(m.logFields(v6)).
+					Info("Shutting down persistent DHCP INFORM client")
 
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()

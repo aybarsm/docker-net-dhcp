@@ -146,10 +146,9 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		Interface: &EndpointInterface{},
 	}
 
-	if r.Interface != nil && (r.Interface.Address != "" || r.Interface.AddressIPv6 != "") {
-		// TODO: Should we allow static IP's somehow?
-		return res, util.ErrIPAM
-	}
+	// Check for static IP assignment
+	hasStaticIPv4 := r.Interface != nil && r.Interface.Address != ""
+	hasStaticIPv6 := r.Interface != nil && r.Interface.AddressIPv6 != ""
 
 	opts, err := p.netOptions(ctx, r.NetworkID)
 	if err != nil {
@@ -224,30 +223,79 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 				v6str = "v6"
 			}
 
-			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-
-			info, err := udhcpc.GetIP(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{V6: v6})
-			if err != nil {
-				return fmt.Errorf("failed to get initial IP%v address via DHCP%v: %w", v6str, v6str, err)
-			}
-			ip, err := netlink.ParseAddr(info.IP)
-			if err != nil {
-				return fmt.Errorf("failed to parse initial IP%v address: %w", v6str, err)
-			}
-
 			hint := p.joinHints[r.EndpointID]
-			if v6 {
-				res.Interface.AddressIPv6 = info.IP
-				hint.IPv6 = ip
-				// No gateways in DHCPv6!
-			} else {
-				res.Interface.Address = info.IP
-				hint.IPv4 = ip
-				hint.Gateway = info.Gateway
+			
+			// Check if static IP is provided
+			var staticIP string
+			if v6 && hasStaticIPv6 {
+				staticIP = r.Interface.AddressIPv6
+			} else if !v6 && hasStaticIPv4 {
+				staticIP = r.Interface.Address
 			}
-			p.joinHints[r.EndpointID] = hint
 
+			if staticIP != "" {
+				// Use static IP - parse and assign directly
+				ip, err := netlink.ParseAddr(staticIP)
+				if err != nil {
+					return fmt.Errorf("failed to parse static IP%v address: %w", v6str, err)
+				}
+
+				// Assign static IP to interface
+				if err := netlink.AddrAdd(ctrLink, ip); err != nil {
+					return fmt.Errorf("failed to assign static IP%v address: %w", v6str, err)
+				}
+
+				if v6 {
+					res.Interface.AddressIPv6 = staticIP
+					hint.IPv6 = ip
+					hint.IsStaticIPv6 = true
+				} else {
+					res.Interface.Address = staticIP
+					hint.IPv4 = ip
+					hint.IsStaticIPv4 = true
+				}
+
+				// For static IPs, we still need network configuration (gateway, DNS, etc.)
+				// Use DHCP INFORM to get configuration without requesting an IP
+				timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+
+				info, err := udhcpc.GetNetworkConfig(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{V6: v6})
+				if err != nil {
+					log.WithError(err).WithField("interface", ctrName).WithField("ipv6", v6).
+						Warn("Failed to get network configuration via DHCP INFORM - using static IP without DHCP config")
+				} else {
+					// Only set gateway from DHCP INFORM for IPv4 (DHCPv6 doesn't provide gateway)
+					if !v6 && info.Gateway != "" {
+						hint.Gateway = info.Gateway
+					}
+				}
+			} else {
+				// Use DHCP to get IP address
+				timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+
+				info, err := udhcpc.GetIP(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{V6: v6})
+				if err != nil {
+					return fmt.Errorf("failed to get initial IP%v address via DHCP%v: %w", v6str, v6str, err)
+				}
+				ip, err := netlink.ParseAddr(info.IP)
+				if err != nil {
+					return fmt.Errorf("failed to parse initial IP%v address: %w", v6str, err)
+				}
+
+				if v6 {
+					res.Interface.AddressIPv6 = info.IP
+					hint.IPv6 = ip
+					// No gateways in DHCPv6!
+				} else {
+					res.Interface.Address = info.IP
+					hint.IPv4 = ip
+					hint.Gateway = info.Gateway
+				}
+			}
+			
+			p.joinHints[r.EndpointID] = hint
 			return nil
 		}
 
@@ -470,6 +518,8 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		m := newDHCPManager(p.docker, r, opts)
 		m.LastIP = hint.IPv4
 		m.LastIPv6 = hint.IPv6
+		m.IsStaticIPv4 = hint.IsStaticIPv4
+		m.IsStaticIPv6 = hint.IsStaticIPv6
 
 		if err := m.Start(ctx); err != nil {
 			log.WithError(err).WithFields(log.Fields{
