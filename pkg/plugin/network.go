@@ -39,34 +39,49 @@ func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 	// Allow either:
 	// 1. null IPAM with 0.0.0.0/0 pool (legacy behavior for DHCP-only)
 	// 2. default IPAM with real subnets (required for static IP support)
-	for _, d := range r.IPv4Data {
-		if d.AddressSpace == "null" && d.Pool == "0.0.0.0/0" {
-			// Legacy DHCP-only mode
-			continue
-		} else if d.AddressSpace == "default" {
-			// Static IP support mode - validate subnet format
-			_, _, err := net.ParseCIDR(d.Pool)
-			if err != nil {
-				return fmt.Errorf("invalid IPv4 subnet pool %v: %w", d.Pool, err)
+	// 3. empty IPAM data (when using --subnet without --ipam-driver=null)
+	
+	// If no IPv4Data is provided, assume default IPAM with subnets (static IP support mode)
+	if len(r.IPv4Data) == 0 {
+		log.Debug("No IPv4Data provided - assuming default IPAM for static IP support")
+	} else {
+		for _, d := range r.IPv4Data {
+			if d.AddressSpace == "null" && d.Pool == "0.0.0.0/0" {
+				// Legacy DHCP-only mode
+				continue
+			} else if d.AddressSpace == "default" || d.AddressSpace == "" {
+				// Static IP support mode - validate subnet format if pool is specified
+				if d.Pool != "" && d.Pool != "0.0.0.0/0" {
+					_, _, err := net.ParseCIDR(d.Pool)
+					if err != nil {
+						return fmt.Errorf("invalid IPv4 subnet pool %v: %w", d.Pool, err)
+					}
+				}
+			} else {
+				return util.ErrIPAM
 			}
-		} else {
-			return util.ErrIPAM
 		}
 	}
 	
 	// Similar validation for IPv6
-	for _, d := range r.IPv6Data {
-		if d.AddressSpace == "null" && d.Pool == "::/0" {
-			// Legacy DHCP-only mode
-			continue
-		} else if d.AddressSpace == "default" {
-			// Static IP support mode - validate subnet format
-			_, _, err := net.ParseCIDR(d.Pool)
-			if err != nil {
-				return fmt.Errorf("invalid IPv6 subnet pool %v: %w", d.Pool, err)
+	if len(r.IPv6Data) == 0 {
+		log.Debug("No IPv6Data provided - assuming default IPAM for static IP support")
+	} else {
+		for _, d := range r.IPv6Data {
+			if d.AddressSpace == "null" && d.Pool == "::/0" {
+				// Legacy DHCP-only mode
+				continue
+			} else if d.AddressSpace == "default" || d.AddressSpace == "" {
+				// Static IP support mode - validate subnet format if pool is specified
+				if d.Pool != "" && d.Pool != "::/0" {
+					_, _, err := net.ParseCIDR(d.Pool)
+					if err != nil {
+						return fmt.Errorf("invalid IPv6 subnet pool %v: %w", d.Pool, err)
+					}
+				}
+			} else {
+				return util.ErrIPAM
 			}
-		} else {
-			return util.ErrIPAM
 		}
 	}
 
