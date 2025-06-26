@@ -26,6 +26,8 @@ const CLIOptionsKey string = "com.docker.network.generic"
 // used)
 func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 	log.WithField("options", r.Options).Debug("CreateNetwork options")
+	log.WithField("ipv4_data", r.IPv4Data).Debug("CreateNetwork IPv4 data")
+	log.WithField("ipv6_data", r.IPv6Data).Debug("CreateNetwork IPv6 data")
 
 	opts, err := decodeOpts(r.Options[util.OptionsKeyGeneric])
 	if err != nil {
@@ -36,51 +38,61 @@ func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 		return util.ErrBridgeRequired
 	}
 
-	// Allow either:
-	// 1. null IPAM with 0.0.0.0/0 pool (legacy behavior for DHCP-only)
-	// 2. default IPAM with real subnets (required for static IP support)
-	// 3. empty IPAM data (when using --subnet without --ipam-driver=null)
+	// Support both DHCP-only and static IP modes:
+	// 1. null IPAM driver: Pure DHCP mode (original behavior)
+	// 2. default IPAM driver with subnets: Static IP support mode
 	
-	// If no IPv4Data is provided, assume default IPAM with subnets (static IP support mode)
-	if len(r.IPv4Data) == 0 {
-		log.Debug("No IPv4Data provided - assuming default IPAM for static IP support")
-	} else {
-		for _, d := range r.IPv4Data {
-			if d.AddressSpace == "null" && d.Pool == "0.0.0.0/0" {
-				// Legacy DHCP-only mode
-				continue
-			} else if d.AddressSpace == "default" || d.AddressSpace == "" {
-				// Static IP support mode - validate subnet format if pool is specified
-				if d.Pool != "" && d.Pool != "0.0.0.0/0" {
-					_, _, err := net.ParseCIDR(d.Pool)
-					if err != nil {
-						return fmt.Errorf("invalid IPv4 subnet pool %v: %w", d.Pool, err)
-					}
-				}
-			} else {
-				return util.ErrIPAM
+	// Check if any IPv4 data uses null IPAM
+	hasNullIPAM := false
+	for _, d := range r.IPv4Data {
+		if d.AddressSpace == "null" {
+			hasNullIPAM = true
+			if d.Pool != "0.0.0.0/0" {
+				return fmt.Errorf("null IPAM driver requires pool 0.0.0.0/0, got %v", d.Pool)
 			}
 		}
 	}
 	
-	// Similar validation for IPv6
-	if len(r.IPv6Data) == 0 {
-		log.Debug("No IPv6Data provided - assuming default IPAM for static IP support")
-	} else {
+	// Check IPv6 null IPAM as well
+	for _, d := range r.IPv6Data {
+		if d.AddressSpace == "null" {
+			hasNullIPAM = true
+			if d.Pool != "::/0" {
+				return fmt.Errorf("null IPAM driver requires pool ::/0, got %v", d.Pool)
+			}
+		}
+	}
+	
+	// If using null IPAM, all pools must be null
+	if hasNullIPAM {
+		for _, d := range r.IPv4Data {
+			if d.AddressSpace != "null" || d.Pool != "0.0.0.0/0" {
+				return fmt.Errorf("mixed IPAM drivers not supported: found null and non-null")
+			}
+		}
 		for _, d := range r.IPv6Data {
-			if d.AddressSpace == "null" && d.Pool == "::/0" {
-				// Legacy DHCP-only mode
-				continue
-			} else if d.AddressSpace == "default" || d.AddressSpace == "" {
-				// Static IP support mode - validate subnet format if pool is specified
-				if d.Pool != "" && d.Pool != "::/0" {
-					_, _, err := net.ParseCIDR(d.Pool)
-					if err != nil {
-						return fmt.Errorf("invalid IPv6 subnet pool %v: %w", d.Pool, err)
-					}
+			if d.AddressSpace != "null" || d.Pool != "::/0" {
+				return fmt.Errorf("mixed IPAM drivers not supported: found null and non-null")
+			}
+		}
+		log.Debug("Using null IPAM driver - DHCP-only mode")
+	} else {
+		// Using default IPAM - validate subnet format for static IP support
+		log.Debug("Using default IPAM driver - static IP support mode")
+		for _, d := range r.IPv4Data {
+			if d.Pool != "" {
+				_, _, err := net.ParseCIDR(d.Pool)
+				if err != nil {
+					return fmt.Errorf("invalid IPv4 subnet %v: %w", d.Pool, err)
 				}
-			} else {
-				return util.ErrIPAM
+			}
+		}
+		for _, d := range r.IPv6Data {
+			if d.Pool != "" {
+				_, _, err := net.ParseCIDR(d.Pool)
+				if err != nil {
+					return fmt.Errorf("invalid IPv6 subnet %v: %w", d.Pool, err)
+				}
 			}
 		}
 	}
