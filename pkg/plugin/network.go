@@ -36,8 +36,36 @@ func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 		return util.ErrBridgeRequired
 	}
 
+	// Allow either:
+	// 1. null IPAM with 0.0.0.0/0 pool (legacy behavior for DHCP-only)
+	// 2. default IPAM with real subnets (required for static IP support)
 	for _, d := range r.IPv4Data {
-		if d.AddressSpace != "null" || d.Pool != "0.0.0.0/0" {
+		if d.AddressSpace == "null" && d.Pool == "0.0.0.0/0" {
+			// Legacy DHCP-only mode
+			continue
+		} else if d.AddressSpace == "default" {
+			// Static IP support mode - validate subnet format
+			_, _, err := net.ParseCIDR(d.Pool)
+			if err != nil {
+				return fmt.Errorf("invalid IPv4 subnet pool %v: %w", d.Pool, err)
+			}
+		} else {
+			return util.ErrIPAM
+		}
+	}
+	
+	// Similar validation for IPv6
+	for _, d := range r.IPv6Data {
+		if d.AddressSpace == "null" && d.Pool == "::/0" {
+			// Legacy DHCP-only mode
+			continue
+		} else if d.AddressSpace == "default" {
+			// Static IP support mode - validate subnet format
+			_, _, err := net.ParseCIDR(d.Pool)
+			if err != nil {
+				return fmt.Errorf("invalid IPv6 subnet pool %v: %w", d.Pool, err)
+			}
+		} else {
 			return util.ErrIPAM
 		}
 	}
